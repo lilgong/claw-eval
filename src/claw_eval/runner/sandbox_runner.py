@@ -49,7 +49,10 @@ class SandboxRunner:
         self._config = sandbox_config
         self._image = image or sandbox_config.image
 
-        kwargs: dict[str, Any] = {}
+        # The Docker SDK defaults to a 60-second API timeout.  Under a
+        # high-concurrency batch the daemon can take longer to create or
+        # remove containers, even though the operation eventually succeeds.
+        kwargs: dict[str, Any] = {"timeout": 180}
         if sandbox_config.docker_host:
             kwargs["base_url"] = sandbox_config.docker_host
         self._docker = docker.from_env(**kwargs)

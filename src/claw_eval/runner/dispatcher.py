@@ -7,6 +7,7 @@ import time
 
 import httpx
 
+from ..api_health import MARKER
 from ..models.content import TextBlock, ToolResultBlock, ToolUseBlock
 from ..models.tool import ToolEndpoint
 from ..models.trace import ToolDispatch
@@ -55,6 +56,8 @@ class ToolDispatcher:
             )
             latency_ms = (time.monotonic() - t0) * 1000
             resp_body = resp.json()
+            if isinstance(resp_body, dict) and MARKER in str(resp_body.get("error", "")):
+                raise RuntimeError(resp_body["error"])
 
             is_error = resp.status_code >= 400
             content_text = json.dumps(resp_body, ensure_ascii=False)
@@ -75,6 +78,8 @@ class ToolDispatcher:
                 latency_ms=latency_ms,
             )
         except Exception as exc:
+            if MARKER in str(exc):
+                raise
             latency_ms = (time.monotonic() - t0) * 1000
             result = ToolResultBlock(
                 tool_use_id=tool_use.id,

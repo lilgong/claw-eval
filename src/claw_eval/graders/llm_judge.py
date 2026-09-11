@@ -11,6 +11,7 @@ import httpx
 from openai import OpenAI
 from pydantic import BaseModel
 
+from ..api_health import marker_from_exception
 from ..models.trace import _now
 
 
@@ -198,6 +199,12 @@ class LLMJudge:
                       f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
                 time.sleep(delay)
 
+        assert last_exc is not None
+        api_failure = marker_from_exception("judge", last_exc)
+        if api_failure:
+            raise RuntimeError(api_failure) from last_exc
+        raise last_exc
+
     def evaluate_actions(
         self,
         task_prompt: str,
@@ -272,6 +279,12 @@ class LLMJudge:
                 print(f"[judge-retry] ({status or type(exc).__name__}), "
                       f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
                 time.sleep(delay)
+
+        assert last_exc is not None
+        api_failure = marker_from_exception("judge", last_exc)
+        if api_failure:
+            raise RuntimeError(api_failure) from last_exc
+        raise last_exc
 
     def evaluate_visual(
         self,
@@ -386,6 +399,12 @@ class LLMJudge:
                 print(f"[judge-visual-retry] ({status or type(exc).__name__}), "
                       f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
                 time.sleep(delay)
+
+        assert last_exc is not None
+        api_failure = marker_from_exception("judge", last_exc)
+        if api_failure:
+            raise RuntimeError(api_failure) from last_exc
+        raise last_exc
 
     def get_call_log(self) -> list[dict]:
         return list(self._call_log)

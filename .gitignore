@@ -8,6 +8,7 @@ build/
 .venv/
 .env
 token_usage_log/
+serp_request_log/
 uv.lock
 
 # Traces (generated output, don't commit)
@@ -17,10 +18,11 @@ traces_*/
 .vscode/
 CLAUDE.md
 *.sh
+!run_batch.sh
 
 # Local evaluation inputs and launch configuration
 model_configs/
-tasks-08*/
+tasks-*/
 *.tar.gz
 *.tgz
 *.rar
@@ -29,6 +31,7 @@ tasks/*/fixtures/*.mp4
 tasks/*/fixtures/*.webm
 
 logs/
+diagnostics/
 
 docs/
 

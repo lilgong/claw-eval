@@ -24,19 +24,12 @@ def _detect_language(query: str) -> tuple[str, str]:
     return "en", "us"
 
 
-def _log_serp_request(query: str, status: int) -> None:
+def _record_serp_request(query: str, status: int) -> None:
     """Record a Serper request without making logging affect search."""
     try:
-        from claw_eval.token_log import log_usage
+        from claw_eval.serp_log import log_serp_request
 
-        log_usage(
-            role="serp",
-            model="serper/search",
-            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            messages=[{"role": "user", "content": query}],
-            answer=f"HTTP {status}",
-            api_key=SERP_DEV_KEY,
-        )
+        log_serp_request(query=query, status=status)
     except Exception:
         pass
 
@@ -78,13 +71,13 @@ def search_serp(
     }
     try:
         resp = requests.post(SERP_API_URL, headers=headers, json=body, timeout=timeout)
-        _log_serp_request(query, resp.status_code)
+        _record_serp_request(query, resp.status_code)
         if raw_save_path and resp.status_code == 200:
             os.makedirs(os.path.dirname(raw_save_path) or ".", exist_ok=True)
             with open(raw_save_path, "w", encoding="utf-8") as f:
                 f.write(resp.text)
         if resp.status_code != 200:
-            return {"status": resp.status_code, "output": []}
+            return {"status": resp.status_code, "output": [], "error": resp.text[:300]}
         data = resp.json()
         results = [
             {
@@ -98,7 +91,7 @@ def search_serp(
         ]
         return {"status": resp.status_code, "output": results}
     except Exception as e:
-        return {"status": -1, "output": []}
+        return {"status": -1, "output": [], "error": str(e)[:300]}
 
 
 if __name__ == "__main__":

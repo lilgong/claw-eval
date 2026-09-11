@@ -7,6 +7,7 @@ import time
 
 from openai import OpenAI
 
+from ..api_health import marker_from_exception
 from ..models.message import Message
 
 
@@ -73,6 +74,7 @@ class UserAgent:
         )
 
         max_retries = 30
+        last_exc: Exception | None = None
         for attempt in range(max_retries):
             try:
                 resp = self.client.chat.completions.create(
@@ -91,6 +93,7 @@ class UserAgent:
                     return text
                 return None
             except Exception as exc:
+                last_exc = exc
                 delay = min(2 ** (attempt + 1), 16) + random.uniform(0, 1)
                 print(
                     f"[user-agent-retry] {type(exc).__name__}, "
@@ -98,5 +101,10 @@ class UserAgent:
                 )
                 time.sleep(delay)
 
-        # All retries exhausted — gracefully end the conversation
+        # Propagate only credible API-wide failures to the batch circuit.
+        assert last_exc is not None
+        api_failure = marker_from_exception("user_agent", last_exc)
+        if api_failure:
+            raise RuntimeError(api_failure) from last_exc
+        # Preserve the original behavior for content- or request-specific errors.
         return None

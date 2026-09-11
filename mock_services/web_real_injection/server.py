@@ -36,7 +36,10 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+from claw_eval.api_health import failure_marker
 
 app = FastAPI(title="Real Web API Proxy with Injection")
 
@@ -294,6 +297,15 @@ def web_search(req: SearchRequest) -> dict[str, Any]:
     try:
         num = min(req.max_results, 10)
         serp_result = search_serp(query=req.query, num=num, timeout=20)
+        upstream_status = serp_result.get("status")
+        if upstream_status != 200:
+            api_failure = failure_marker(
+                "serp", upstream_status, serp_result.get("error", "")
+            )
+            if api_failure:
+                resp = {"error": api_failure, "query": req.query}
+                _log_call("/web/search", req.model_dump(), resp)
+                return JSONResponse(status_code=502, content=resp)
 
         results = []
         for item in serp_result.get("output", []):

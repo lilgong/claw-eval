@@ -964,12 +964,21 @@ def _run_single_task(
                             "passed": is_pass(task_score),
                         })
                     except Exception as trial_exc:
+                        from .api_health import parse_marker
+
+                        trial_error = str(trial_exc)
                         result["trials"].append({
                             "trial": i,
-                            "error": str(trial_exc),
+                            "error": trial_error,
                             "task_score": 0.0,
                             "passed": False,
                         })
+                        parsed_failure = parse_marker(trial_error)
+                        if parsed_failure and parsed_failure[0] in {
+                            "judge", "user_agent", "serp",
+                        }:
+                            result["error"] = trial_error
+                            break
             break  # success — exit retry loop
         except (APIConnectionError, APITimeoutError, InternalServerError, ConnectionError) as e:
             if attempt < max_retries - 1:
@@ -1265,6 +1274,10 @@ def cmd_batch(args: argparse.Namespace) -> None:
     n_pass_at = 0       # pass@k: at least one trial passed
     score_sum = 0.0
     finished_tasks = 0
+    from .api_health import parse_marker, record_failure
+    api_failure_times: dict[str, list[float]] = {}
+    circuit_open = False
+    circuit_reason: str | None = None
 
     # Each worker slot gets a unique port offset: slot 0 → 0, slot 1 → 50, ...
     # Tasks use ports 9100-9129 (span=30); stride of 50 leaves headroom.
@@ -1333,6 +1346,39 @@ def cmd_batch(args: argparse.Namespace) -> None:
 
                 results.append(res)
 
+                # Open the batch circuit only for confirmed upstream API failures.
+                # Permanent auth/quota failures trip immediately; transient failures
+                # require three task-level failures from the same API within 60s.
+                task_api_failures: set[tuple[str, str]] = set()
+                candidate_errors = [res.get("error", "")]
+                candidate_errors.extend(
+                    trial.get("error", "") for trial in res.get("trials", [])
+                )
+                for error_text in candidate_errors:
+                    parsed = parse_marker(error_text)
+                    # Only auxiliary APIs may stop a batch. A busy or slow
+                    # tested-model endpoint must never open this circuit.
+                    if parsed and parsed[0] in {"judge", "user_agent", "serp"}:
+                        task_api_failures.add(parsed)
+
+                now = time.monotonic()
+                for source, kind in task_api_failures:
+                    if circuit_open:
+                        break
+                    circuit_open = record_failure(
+                        api_failure_times, source, kind, now
+                    )
+                    if circuit_open:
+                        circuit_reason = f"{source}:{kind}"
+                        dropped = len(task_queue)
+                        task_queue.clear()
+                        print(
+                            f"[CIRCUIT BREAKER] {source} API confirmed {kind} failure; "
+                            f"stopped submitting {dropped} remaining task(s). "
+                            "Already-running tasks will finish cleanup."
+                        )
+                        break
+
                 # Incrementally write batch_results.json after each task
                 _partial_out = Path(batch_trace_dir)
                 _partial_out.mkdir(parents=True, exist_ok=True)
@@ -1399,7 +1445,7 @@ def cmd_batch(args: argparse.Namespace) -> None:
                 )
 
                 # Submit next task if any
-                if task_queue and available_slots:
+                if not circuit_open and task_queue and available_slots:
                     _submit(task_queue.pop(0))
 
                 break  # restart as_completed loop with updated pending
@@ -1435,7 +1481,12 @@ def cmd_batch(args: argparse.Namespace) -> None:
 
     # --- Summary ---
     print(f"\n{'='*60}")
-    if prev_results is not None:
+    if circuit_open:
+        print(
+            f"BATCH STOPPED BY API CIRCUIT — {finished_tasks} task(s) finished "
+            f"this run; reason={circuit_reason}"
+        )
+    elif prev_results is not None:
         print(f"BATCH COMPLETE (rerun-errors merge) — {total} tasks")
     elif continue_dir:
         print(f"BATCH COMPLETE (continue merge) — {total} tasks")
@@ -1527,7 +1578,10 @@ def cmd_batch(args: argparse.Namespace) -> None:
     summary_file = out_dir / "batch_summary.json"
     summary_data = {
         "tasks": total,
+        "tasks_finished_this_run": finished_tasks,
         "trials_per_task": trials,
+        "stopped_by_api_circuit": circuit_open,
+        "circuit_reason": circuit_reason,
         f"pass_hat_{trials}": n_pass_hat,
         f"pass_at_{trials}": n_pass_at,
         "errored": errored,
@@ -1546,6 +1600,8 @@ def cmd_batch(args: argparse.Namespace) -> None:
         json.dump(summary_data, f, indent=2, ensure_ascii=False)
     print(f"\n  Results saved to {results_file}")
     print(f"  Summary saved to {summary_file}")
+    if circuit_open:
+        raise SystemExit(3)
 
 
 def cmd_cleanup(args: argparse.Namespace) -> None:
