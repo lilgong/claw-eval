@@ -45,6 +45,10 @@ class ModelConfig(BaseModel):
     input_modalities: list[str] = Field(default_factory=lambda: ["text"])
     system_prompt_prefix: str | None = None
     extra_body: dict | None = None
+    # Extra HTTP headers passed to the OpenAI-compatible endpoint. This is
+    # useful for gateways that carry routing or credential metadata outside
+    # the normal Authorization header.
+    extra_headers: dict[str, str] | None = None
     reasoning_effort: str | None = None
     # Key used to carry reasoning into multi-turn history. None = infer from
     # base_url (OpenRouter → "reasoning"; SGLang/vLLM/others → "reasoning_content").

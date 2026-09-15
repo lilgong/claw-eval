@@ -241,12 +241,14 @@ class OpenAICompatProvider:
         api_key: str | None = None,
         base_url: str | None = None,
         extra_body: dict | None = None,
+        extra_headers: dict[str, str] | None = None,
         temperature: float | None = 0.0,
         reasoning_effort: str | None = None,
         reasoning_field: str | None = None,
     ) -> None:
         self.model_id = model_id
         self.extra_body = extra_body or {}
+        self.extra_headers = dict(extra_headers or {})
         self.temperature = temperature
         self.reasoning_effort = reasoning_effort
         # Reasoning is carried into multi-turn history under a provider-specific
@@ -262,6 +264,7 @@ class OpenAICompatProvider:
         self.client = OpenAI(
             api_key=resolved_key,
             base_url=base_url,
+            default_headers=self.extra_headers or None,
             timeout=300.0,
         )
 
