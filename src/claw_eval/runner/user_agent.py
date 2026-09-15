@@ -7,7 +7,7 @@ import time
 
 from openai import OpenAI
 
-from ..api_health import marker_from_exception
+from ..api_health import marker_from_exception, parse_marker
 from ..models.message import Message
 
 
@@ -94,6 +94,16 @@ class UserAgent:
                 return None
             except Exception as exc:
                 last_exc = exc
+                # Authentication, billing, and other API-wide permanent
+                # failures cannot recover through retrying.  Stop on the
+                # first one so a bad credential does not stall a task for
+                # several minutes before opening the batch circuit.
+                api_failure = marker_from_exception("user_agent", exc)
+                if api_failure and parse_marker(api_failure) == (
+                    "user_agent", "permanent"
+                ):
+                    print("[user-agent-fail] permanent API failure; not retrying")
+                    raise RuntimeError(api_failure) from exc
                 delay = min(2 ** (attempt + 1), 16) + random.uniform(0, 1)
                 print(
                     f"[user-agent-retry] {type(exc).__name__}, "
