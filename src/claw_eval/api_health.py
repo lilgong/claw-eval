@@ -11,6 +11,11 @@ _PERMANENT_HINTS = (
     "insufficient balance", "insufficient credit", "insufficient_quota",
     "not enough credit", "no remaining credit", "credits exhausted",
     "quota exhausted", "quota exceeded", "payment required",
+    # Some OpenAI-compatible gateways report an unavailable or misspelled
+    # model as HTTP 503.  The status is transient-looking, but the response
+    # means this configured model cannot be routed for the current account.
+    "model_not_found", "model not found", "no available channel for model",
+    "unsupported model", "invalid model",
     "余额不足", "额度不足", "鉴权失败", "密钥无效",
 )
 _TRANSIENT_HINTS = (
