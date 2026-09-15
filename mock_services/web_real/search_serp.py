@@ -91,6 +91,10 @@ def search_serp(
         ]
         return {"status": resp.status_code, "output": results}
     except Exception as e:
+        # A transport failure is still a billable/search attempt from the
+        # evaluator's perspective. Record it so per-run usage accounting does
+        # not silently omit timeouts, DNS failures, or connection resets.
+        _record_serp_request(query, -1)
         return {"status": -1, "output": [], "error": str(e)[:300]}
 
 
