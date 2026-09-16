@@ -1624,6 +1624,148 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
         print("No claw-eval containers found.")
 
 
+
+def _preflight_openai_role(
+    label: str,
+    model_id: str,
+    api_key: str | None,
+    base_url: str | None,
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> None:
+    """Verify one OpenAI-compatible role with a minimal completion request."""
+    if not api_key:
+        raise RuntimeError(f"{label}: API key is missing")
+    if not base_url:
+        raise RuntimeError(f"{label}: base URL is missing")
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        default_headers=extra_headers or None,
+        timeout=45.0,
+    )
+    try:
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": "Reply OK."}],
+            max_tokens=8,
+            temperature=0.0,
+        )
+        if not response.choices:
+            raise RuntimeError("response has no choices")
+    finally:
+        client.close()
+
+
+def _preflight_judge(cfg) -> None:
+    """Verify the judge using the same protocol selected by LLMJudge."""
+    judge = cfg.judge
+    if not judge.api_key:
+        raise RuntimeError("judge: API key is missing")
+    model_id = judge.model_id
+    if "gemini" not in model_id.lower() or getattr(judge, "openai_compatible", False):
+        _preflight_openai_role("judge", model_id, judge.api_key, judge.base_url)
+        return
+
+    import httpx
+
+    root = (judge.base_url or "").rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    if not root:
+        raise RuntimeError("judge: base URL is missing")
+    gemini_model = model_id.split("/")[-1]
+    response = httpx.post(
+        f"{root}/v1beta/models/{gemini_model}:generateContent",
+        json={
+            "contents": [{"role": "user", "parts": [{"text": "Reply OK."}]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 8},
+        },
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {judge.api_key}",
+        },
+        timeout=45.0,
+    )
+    response.raise_for_status()
+    candidates = response.json().get("candidates")
+    if not candidates:
+        raise RuntimeError("judge: response has no candidates")
+
+
+def cmd_preflight(args: argparse.Namespace) -> None:
+    """Validate selected tasks, sandbox prerequisites, and configured API roles."""
+    _apply_proxy(getattr(args, "proxy", None))
+    from .config import load_config
+    from .models.task import TaskDefinition
+
+    cfg = load_config(args.config)
+    tasks_dir = Path(args.tasks_dir)
+    failures: list[str] = []
+    tasks = []
+    if not tasks_dir.is_dir():
+        failures.append(f"tasks directory not found: {tasks_dir}")
+    else:
+        yaml_files = sorted(tasks_dir.glob("*/task.yaml"))
+        if not yaml_files:
+            failures.append(f"no task.yaml found in: {tasks_dir}")
+        for yaml_file in yaml_files:
+            try:
+                tasks.append(TaskDefinition.from_yaml(yaml_file))
+            except Exception as exc:
+                failures.append(f"invalid task {yaml_file.parent.name}: {exc}")
+
+    if getattr(args, "sandbox", False):
+        try:
+            import docker
+            docker_client = docker.from_env()
+            docker_client.ping()
+            docker_client.images.get(cfg.sandbox.image)
+        except Exception as exc:
+            failures.append(f"sandbox image {cfg.sandbox.image!r} is unavailable: {exc}")
+
+    checks = [
+        (
+            "model",
+            lambda: _preflight_openai_role(
+                "model",
+                cfg.model.model_id,
+                cfg.model.api_key,
+                cfg.model.base_url,
+                extra_headers=cfg.model.extra_headers,
+            ),
+        ),
+    ]
+    if cfg.judge.enabled:
+        checks.append(("judge", lambda: _preflight_judge(cfg)))
+    if any(getattr(getattr(task, "user_agent", None), "enabled", False) for task in tasks):
+        checks.append((
+            "user_agent",
+            lambda: _preflight_openai_role(
+                "user_agent",
+                cfg.user_agent_model.model_id,
+                cfg.user_agent_model.api_key,
+                cfg.user_agent_model.base_url,
+            ),
+        ))
+
+    print(f"[preflight] tasks={len(tasks)} sandbox={bool(getattr(args, 'sandbox', False))}")
+    for label, check in checks:
+        try:
+            check()
+            print(f"[preflight] {label}: OK")
+        except Exception as exc:
+            failures.append(f"{label}: {type(exc).__name__}: {exc}")
+            print(f"[preflight] {label}: FAIL")
+
+    if failures:
+        for failure in failures:
+            print(f"[preflight] FAIL: {failure}")
+        raise SystemExit(2)
+    print("[preflight] OK")
+
 def cmd_list(args: argparse.Namespace) -> None:
     """List available tasks."""
     tasks_dir = Path(args.tasks_dir)
@@ -1652,7 +1794,7 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--api-key", default=None, help="API key (default: from config.yaml / $OPENAI_API_KEY)")
     p_run.add_argument("--base-url", default=None, help="Base URL for OpenAI-compatible API")
     p_run.add_argument("--config", default=None, help="Path to config.yaml")
-    p_run.add_argument("--trials", type=int, default=1, help="Number of trials")
+    p_run.add_argument("--trials", type=int, default=3, help="Number of trials")
     p_run.add_argument("--trace-dir", default=None, help="Output directory for traces")
     p_run.add_argument("--judge-model", default=None, help="Override judge model ID")
     p_run.add_argument("--no-judge", action="store_true", help="Disable LLM judge for communication scoring")
@@ -1691,6 +1833,13 @@ def main(argv: list[str] | None = None) -> None:
     p_grade.add_argument("--no-judge", action="store_true", help="Disable LLM judge for communication scoring")
     p_grade.add_argument("--proxy", default=None, help="HTTP proxy URL for judge API traffic")
 
+    # preflight
+    p_preflight = sub.add_parser("preflight", help="Validate selected tasks and API prerequisites")
+    p_preflight.add_argument("--tasks-dir", required=True, help="Selected tasks directory")
+    p_preflight.add_argument("--config", required=True, help="Path to config.yaml")
+    p_preflight.add_argument("--sandbox", action="store_true", help="Verify the configured sandbox image")
+    p_preflight.add_argument("--proxy", default=None, help="HTTP proxy URL for model/judge API traffic")
+
     # batch
     p_batch = sub.add_parser("batch", help="Run all tasks in parallel")
     p_batch.add_argument("--tasks-dir", default="tasks", help="Tasks directory")
@@ -1702,7 +1851,7 @@ def main(argv: list[str] | None = None) -> None:
     p_batch.add_argument("--api-key", default=None)
     p_batch.add_argument("--base-url", default=None)
     p_batch.add_argument("--config", default=None, help="Path to config.yaml")
-    p_batch.add_argument("--trials", type=int, default=1)
+    p_batch.add_argument("--trials", type=int, default=3)
     p_batch.add_argument("--trace-dir", default=None, help="Output directory for traces")
     p_batch.add_argument("--judge-model", default=None)
     p_batch.add_argument("--no-judge", action="store_true")
@@ -1739,6 +1888,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_build_image(args)
     elif args.command == "grade":
         cmd_grade(args)
+    elif args.command == "preflight":
+        cmd_preflight(args)
     elif args.command == "batch":
         cmd_batch(args)
     elif args.command == "cleanup":
