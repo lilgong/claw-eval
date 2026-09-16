@@ -41,14 +41,35 @@ set +a
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 
 probe_chat() {
-  local label=$1 model_id=$2 base_url=$3 api_key=$4
-  local output_file payload status response_model
+  local label=$1 model_id=$2 base_url=$3 api_key=$4 extra_headers_json=${5:-\{\}}
+  local output_file payload status response_model encoded_header decoded_header header_name
+  local has_authorization=0 has_content_type=0
+  local -a header_args
   output_file=$(mktemp)
   payload=$(jq -nc --arg model "$model_id" '{model:$model,messages:[{role:"user",content:"Reply OK"}],max_tokens:8}')
+  header_args=()
+  while IFS= read -r encoded_header; do
+    [ -n "$encoded_header" ] || continue
+    decoded_header=$(printf '%s' "$encoded_header" | base64 --decode)
+    header_name=${decoded_header%%:*}
+    case ${header_name,,} in
+      authorization) has_authorization=1 ;;
+      content-type) has_content_type=1 ;;
+    esac
+    header_args+=(-H "$decoded_header")
+  done < <(
+    jq -r 'to_entries[] | "\(.key): \(.value)" | @base64' \
+      <<<"$extra_headers_json"
+  )
+  if [ "$has_authorization" -eq 0 ]; then
+    header_args+=(-H "Authorization: Bearer $api_key")
+  fi
+  if [ "$has_content_type" -eq 0 ]; then
+    header_args+=(-H 'Content-Type: application/json')
+  fi
   status=$(curl -sS -m 45 -o "$output_file" -w '%{http_code}' \
     "${base_url%/}/chat/completions" \
-    -H "Authorization: Bearer $api_key" \
-    -H 'Content-Type: application/json' \
+    "${header_args[@]}" \
     -d "$payload" || true)
   if [ "$status" = 200 ]; then
     if response_model=$(.venv/bin/python - "$output_file" <<'PY'
@@ -127,23 +148,50 @@ preflight() {
     failed=1
   fi
 
-  local model_id model_url model_key judge_id judge_url judge_key ua_id ua_url ua_key sandbox_on sandbox_image
-  IFS=$'\t' read -r model_id model_url model_key judge_id judge_url judge_key ua_id ua_url ua_key sandbox_on sandbox_image \
-    < <(.venv/bin/python - "$config_path" <<'PY'
-import sys
+  local config_json model_id model_url model_key model_headers
+  local judge_id judge_url judge_key ua_id ua_url ua_key sandbox_on sandbox_image
+  config_json=$(.venv/bin/python - "$config_path" <<'PY'
+import json, sys
 from claw_eval.config import load_config
 c = load_config(sys.argv[1])
-values = (
-    c.model.model_id, c.model.base_url or "", c.model.api_key or "",
-    c.judge.model_id, c.judge.base_url or "", c.judge.api_key or "",
-    c.user_agent_model.model_id, c.user_agent_model.base_url or "", c.user_agent_model.api_key or "",
-    "1" if c.sandbox.enabled else "0", c.sandbox.image,
-)
-print("\t".join(values))
+print(json.dumps({
+    "model": {
+        "id": c.model.model_id,
+        "url": c.model.base_url or "",
+        "key": c.model.api_key or "",
+        "headers": c.model.extra_headers or {},
+    },
+    "judge": {
+        "id": c.judge.model_id,
+        "url": c.judge.base_url or "",
+        "key": c.judge.api_key or "",
+    },
+    "user_agent": {
+        "id": c.user_agent_model.model_id,
+        "url": c.user_agent_model.base_url or "",
+        "key": c.user_agent_model.api_key or "",
+    },
+    "sandbox": {
+        "enabled": c.sandbox.enabled,
+        "image": c.sandbox.image,
+    },
+}))
 PY
-    )
+  )
+  model_id=$(jq -r '.model.id' <<<"$config_json")
+  model_url=$(jq -r '.model.url' <<<"$config_json")
+  model_key=$(jq -r '.model.key' <<<"$config_json")
+  model_headers=$(jq -c '.model.headers' <<<"$config_json")
+  judge_id=$(jq -r '.judge.id' <<<"$config_json")
+  judge_url=$(jq -r '.judge.url' <<<"$config_json")
+  judge_key=$(jq -r '.judge.key' <<<"$config_json")
+  ua_id=$(jq -r '.user_agent.id' <<<"$config_json")
+  ua_url=$(jq -r '.user_agent.url' <<<"$config_json")
+  ua_key=$(jq -r '.user_agent.key' <<<"$config_json")
+  sandbox_on=$(jq -r 'if .sandbox.enabled then "1" else "0" end' <<<"$config_json")
+  sandbox_image=$(jq -r '.sandbox.image' <<<"$config_json")
 
-  probe_chat "被测模型" "$model_id" "$model_url" "$model_key" || failed=1
+  probe_chat "被测模型" "$model_id" "$model_url" "$model_key" "$model_headers" || failed=1
   if [ "$model_url|$model_key" = "$judge_url|$judge_key" ]; then
     echo "  [WARN] 被测模型与 judge 共用 endpoint/key；会共享限流与额度"
   fi

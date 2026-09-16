@@ -358,6 +358,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             api_key=args.api_key or cfg.model.api_key,
             base_url=args.base_url or cfg.model.base_url,
             extra_body=cfg.model.extra_body,
+            extra_headers=cfg.model.extra_headers,
             temperature=cfg.model.temperature,
             reasoning_effort=cfg.model.reasoning_effort,
             reasoning_field=cfg.model.reasoning_field,
@@ -484,6 +485,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         api_key=args.api_key or cfg.model.api_key,
         base_url=args.base_url or cfg.model.base_url,
         extra_body=cfg.model.extra_body,
+        extra_headers=cfg.model.extra_headers,
         temperature=cfg.model.temperature,
         reasoning_effort=cfg.model.reasoning_effort,
         reasoning_field=cfg.model.reasoning_field,
@@ -602,6 +604,7 @@ def cmd_run_inner(args: argparse.Namespace) -> None:
         api_key=args.api_key or cfg.model.api_key or os.environ.get("OPENAI_API_KEY"),
         base_url=args.base_url or cfg.model.base_url,
         extra_body=cfg.model.extra_body,
+        extra_headers=cfg.model.extra_headers,
         temperature=cfg.model.temperature,
         reasoning_effort=cfg.model.reasoning_effort,
         reasoning_field=cfg.model.reasoning_field,
@@ -818,6 +821,7 @@ def _run_single_task(
         api_key=api_key or cfg.model.api_key,
         base_url=base_url or cfg.model.base_url,
         extra_body=cfg.model.extra_body,
+        extra_headers=cfg.model.extra_headers,
         temperature=cfg.model.temperature,
         reasoning_effort=cfg.model.reasoning_effort,
         reasoning_field=cfg.model.reasoning_field,
@@ -1274,8 +1278,7 @@ def cmd_batch(args: argparse.Namespace) -> None:
     n_pass_at = 0       # pass@k: at least one trial passed
     score_sum = 0.0
     finished_tasks = 0
-    from .api_health import parse_marker, record_failure
-    api_failure_times: dict[str, list[float]] = {}
+    from .api_health import parse_marker
     circuit_open = False
     circuit_reason: str | None = None
 
@@ -1346,10 +1349,10 @@ def cmd_batch(args: argparse.Namespace) -> None:
 
                 results.append(res)
 
-                # Open the batch circuit only for confirmed upstream API failures.
-                # Permanent auth/quota failures trip immediately; transient failures
-                # require three task-level failures from the same API within 60s.
-                task_api_failures: set[tuple[str, str]] = set()
+                # Only confirmed permanent auth/quota failures may stop a batch.
+                # Rate limits, timeouts, connection errors, and 5xx responses stay
+                # visible in task results for later analysis and never trip it.
+                permanent_api_failures: set[str] = set()
                 candidate_errors = [res.get("error", "")]
                 candidate_errors.extend(
                     trial.get("error", "") for trial in res.get("trials", [])
@@ -1358,26 +1361,24 @@ def cmd_batch(args: argparse.Namespace) -> None:
                     parsed = parse_marker(error_text)
                     # Only auxiliary APIs may stop a batch. A busy or slow
                     # tested-model endpoint must never open this circuit.
-                    if parsed and parsed[0] in {"judge", "user_agent", "serp"}:
-                        task_api_failures.add(parsed)
+                    if (
+                        parsed
+                        and parsed[0] in {"judge", "user_agent", "serp"}
+                        and parsed[1] == "permanent"
+                    ):
+                        permanent_api_failures.add(parsed[0])
 
-                now = time.monotonic()
-                for source, kind in task_api_failures:
-                    if circuit_open:
-                        break
-                    circuit_open = record_failure(
-                        api_failure_times, source, kind, now
+                if permanent_api_failures:
+                    source = sorted(permanent_api_failures)[0]
+                    circuit_open = True
+                    circuit_reason = f"{source}:permanent"
+                    dropped = len(task_queue)
+                    task_queue.clear()
+                    print(
+                        f"[CIRCUIT BREAKER] {source} API confirmed permanent failure; "
+                        f"stopped submitting {dropped} remaining task(s). "
+                        "Already-running tasks will finish cleanup."
                     )
-                    if circuit_open:
-                        circuit_reason = f"{source}:{kind}"
-                        dropped = len(task_queue)
-                        task_queue.clear()
-                        print(
-                            f"[CIRCUIT BREAKER] {source} API confirmed {kind} failure; "
-                            f"stopped submitting {dropped} remaining task(s). "
-                            "Already-running tasks will finish cleanup."
-                        )
-                        break
 
                 # Incrementally write batch_results.json after each task
                 _partial_out = Path(batch_trace_dir)

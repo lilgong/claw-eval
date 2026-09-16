@@ -11,7 +11,7 @@ import httpx
 from openai import OpenAI
 from pydantic import BaseModel
 
-from ..api_health import marker_from_exception
+from ..api_health import marker_from_exception, parse_marker
 from ..models.trace import _now
 
 
@@ -83,6 +83,14 @@ class LLMJudge:
             )
         print(f"[judge-init] model={model_id} gemini={self._use_gemini}"
               f" url={getattr(self, '_gemini_url', 'N/A')}")
+
+    @staticmethod
+    def _raise_if_permanent(exc: Exception) -> None:
+        """Skip futile outer retries for confirmed auth/billing failures."""
+        api_failure = marker_from_exception("judge", exc)
+        if api_failure and parse_marker(api_failure) == ("judge", "permanent"):
+            print("[judge-fail] permanent API failure; not retrying")
+            raise RuntimeError(api_failure) from exc
 
     def _call_gemini(
         self, system_prompt: str, user_content: str | list[dict],
@@ -189,6 +197,7 @@ class LLMJudge:
                 return result
             except Exception as exc:
                 last_exc = exc
+                self._raise_if_permanent(exc)
                 status = (
                     getattr(exc, "status_code", None)
                     or getattr(exc, "code", None)
@@ -270,6 +279,7 @@ class LLMJudge:
                 return result
             except Exception as exc:
                 last_exc = exc
+                self._raise_if_permanent(exc)
                 status = (
                     getattr(exc, "status_code", None)
                     or getattr(exc, "code", None)
@@ -390,6 +400,7 @@ class LLMJudge:
                 return result
             except Exception as exc:
                 last_exc = exc
+                self._raise_if_permanent(exc)
                 status = (
                     getattr(exc, "status_code", None)
                     or getattr(exc, "code", None)

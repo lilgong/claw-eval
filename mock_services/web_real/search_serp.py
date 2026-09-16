@@ -7,8 +7,12 @@ service while the upstream request uses POST JSON plus Bearer authentication.
 from __future__ import annotations
 
 import os
+import random
 import re
+import time
 import requests
+
+from claw_eval.api_health import classify_failure
 
 SERP_API_URL = os.getenv("SERP_API_URL", "https://yibuapi.com/serper/search")
 SERP_DEV_KEY = (
@@ -16,6 +20,7 @@ SERP_DEV_KEY = (
     or os.getenv("SERP_DEV_KEY")
     or os.getenv("YIBUAPI_KEY", "")
 )
+SERP_MAX_ATTEMPTS = 3
 
 
 def _detect_language(query: str) -> tuple[str, str]:
@@ -24,14 +29,34 @@ def _detect_language(query: str) -> tuple[str, str]:
     return "en", "us"
 
 
-def _record_serp_request(query: str, status: int) -> None:
-    """Record a Serper request without making logging affect search."""
+def _record_serp_request(
+    query: str, status: int, attempt: int, error: str | None = None,
+) -> None:
+    """Record one Serper attempt without making logging affect search."""
     try:
         from claw_eval.serp_log import log_serp_request
 
-        log_serp_request(query=query, status=status)
+        log_serp_request(
+            query=query, status=status, attempt=attempt, error=error,
+        )
     except Exception:
         pass
+
+
+def _retry_delay(attempt: int, response: requests.Response | None = None) -> float:
+    """Return a bounded Retry-After or exponential delay with jitter."""
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(max(float(retry_after), 0.0), 30.0)
+            except ValueError:
+                pass
+    return min(2 ** (attempt - 1), 8) + random.uniform(0.0, 0.5)
+
+
+def _retryable_status(status: int) -> bool:
+    return status == 429 or 500 <= status <= 599
 
 
 def search_serp(
@@ -69,29 +94,71 @@ def search_serp(
         "Authorization": f"Bearer {SERP_DEV_KEY}",
         "Content-Type": "application/json",
     }
-    try:
-        resp = requests.post(SERP_API_URL, headers=headers, json=body, timeout=timeout)
-        _record_serp_request(query, resp.status_code)
-        if raw_save_path and resp.status_code == 200:
-            os.makedirs(os.path.dirname(raw_save_path) or ".", exist_ok=True)
-            with open(raw_save_path, "w", encoding="utf-8") as f:
-                f.write(resp.text)
-        if resp.status_code != 200:
-            return {"status": resp.status_code, "output": [], "error": resp.text[:300]}
-        data = resp.json()
-        results = [
-            {
-                "title": item.get("title", ""),
-                "link": item.get("link", ""),
-                "snippet": item.get("snippet", ""),
-                "date": item.get("date", ""),
-                "query": query,
-            }
-            for item in data.get("organic", [])
-        ]
-        return {"status": resp.status_code, "output": results}
-    except Exception as e:
-        return {"status": -1, "output": [], "error": str(e)[:300]}
+    last_error = ""
+    last_status = -1
+    for attempt in range(1, SERP_MAX_ATTEMPTS + 1):
+        resp: requests.Response | None = None
+        try:
+            resp = requests.post(
+                SERP_API_URL, headers=headers, json=body, timeout=timeout,
+            )
+            last_status = resp.status_code
+            if resp.status_code != 200:
+                last_error = resp.text[:300]
+                _record_serp_request(query, resp.status_code, attempt, last_error)
+                if classify_failure(resp.status_code, last_error) == "permanent":
+                    return {
+                        "status": resp.status_code,
+                        "output": [],
+                        "error": last_error,
+                    }
+                if (
+                    _retryable_status(resp.status_code)
+                    and attempt < SERP_MAX_ATTEMPTS
+                ):
+                    time.sleep(_retry_delay(attempt, resp))
+                    continue
+                return {
+                    "status": resp.status_code,
+                    "output": [],
+                    "error": last_error,
+                }
+
+            try:
+                data = resp.json()
+            except Exception as exc:
+                last_status = -1
+                last_error = f"Invalid JSON response: {exc}"[:300]
+                _record_serp_request(query, resp.status_code, attempt, last_error)
+                if attempt < SERP_MAX_ATTEMPTS:
+                    time.sleep(_retry_delay(attempt, resp))
+                    continue
+                return {"status": -1, "output": [], "error": last_error}
+
+            _record_serp_request(query, resp.status_code, attempt)
+            if raw_save_path:
+                os.makedirs(os.path.dirname(raw_save_path) or ".", exist_ok=True)
+                with open(raw_save_path, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+            results = [
+                {
+                    "title": item.get("title", ""),
+                    "link": item.get("link", ""),
+                    "snippet": item.get("snippet", ""),
+                    "date": item.get("date", ""),
+                    "query": query,
+                }
+                for item in data.get("organic", [])
+            ]
+            return {"status": resp.status_code, "output": results}
+        except Exception as exc:
+            last_status = -1
+            last_error = str(exc)[:300]
+            _record_serp_request(query, -1, attempt, last_error)
+            if attempt < SERP_MAX_ATTEMPTS:
+                time.sleep(_retry_delay(attempt, resp))
+
+    return {"status": last_status, "output": [], "error": last_error}
 
 
 if __name__ == "__main__":

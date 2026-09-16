@@ -47,9 +47,14 @@ def _log_path() -> str:
 
 
 def log_serp_request(
-    *, query: str, status: int, task_id: str | None = None,
+    *,
+    query: str,
+    status: int,
+    attempt: int = 1,
+    error: str | None = None,
+    task_id: str | None = None,
 ) -> None:
-    """Append one Serper request record; logging never affects evaluation."""
+    """Append one Serper attempt record; logging never affects evaluation."""
     if not _enabled():
         return
     try:
@@ -66,7 +71,10 @@ def log_serp_request(
             "call_id": uuid.uuid4().hex[:12],
             "query": query,
             "http_status": int(status),
+            "attempt": int(attempt),
         }
+        if error:
+            record["error"] = " ".join(str(error).split())[:300]
         line = json.dumps(record, ensure_ascii=False) + "\n"
         with _lock, open(_log_path(), "a", encoding="utf-8") as handle:
             try:

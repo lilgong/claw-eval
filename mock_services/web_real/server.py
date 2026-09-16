@@ -33,7 +33,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from claw_eval.api_health import failure_marker
+from claw_eval.api_health import classify_failure, failure_marker
 
 app = FastAPI(title="Real Web API Proxy")
 
@@ -219,13 +219,23 @@ def web_search(req: SearchRequest) -> dict[str, Any]:
         serp_result = search_serp(query=req.query, num=num, timeout=20)
         upstream_status = serp_result.get("status")
         if upstream_status != 200:
+            detail = serp_result.get("error", "")
             api_failure = failure_marker(
-                "serp", upstream_status, serp_result.get("error", "")
+                "serp", upstream_status, detail
             )
-            if api_failure:
+            if classify_failure(upstream_status, detail) == "permanent":
                 resp = {"error": api_failure, "query": req.query}
                 _log_call("/web/search", req.model_dump(), resp)
                 return JSONResponse(status_code=502, content=resp)
+            # Transient upstream failures are ordinary tool errors.  Return
+            # them to the agent so it may retry or choose another approach;
+            # do not cache an empty result or abort the evaluation trial.
+            resp = {
+                "error": f"Search temporarily unavailable (upstream status {upstream_status})",
+                "query": req.query,
+            }
+            _log_call("/web/search", req.model_dump(), resp)
+            return JSONResponse(status_code=502, content=resp)
 
         results = []
         for item in serp_result.get("output", []):
