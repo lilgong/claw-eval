@@ -13,6 +13,9 @@ from ..models.tool import ToolEndpoint
 from ..models.trace import ToolDispatch
 
 
+WEB_SEARCH_TIMEOUT_SECONDS = 150.0
+
+
 class ToolDispatcher:
     """Dispatches tool_use blocks to mock service endpoints via HTTP."""
 
@@ -53,6 +56,13 @@ class ToolDispatcher:
                 method=endpoint.method,
                 url=endpoint.url,
                 json=tool_use.input,
+                # Serper may make three 45-second attempts with backoff. Keep
+                # the normal 30-second limit for every other tool.
+                timeout=(
+                    WEB_SEARCH_TIMEOUT_SECONDS
+                    if tool_use.name == "web_search"
+                    else 30.0
+                ),
             )
             latency_ms = (time.monotonic() - t0) * 1000
             resp_body = resp.json()
