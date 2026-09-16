@@ -7,7 +7,10 @@ service while the upstream request uses POST JSON plus Bearer authentication.
 from __future__ import annotations
 
 import os
+import random
 import re
+import time
+
 import requests
 
 SERP_API_URL = os.getenv("SERP_API_URL", "https://yibuapi.com/serper/search")
@@ -16,6 +19,9 @@ SERP_DEV_KEY = (
     or os.getenv("SERP_DEV_KEY")
     or os.getenv("YIBUAPI_KEY", "")
 )
+SERP_TIMEOUT_SECONDS = 45
+SERP_MAX_ATTEMPTS = 3  # Initial request plus at most two retries.
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def _detect_language(query: str) -> tuple[str, str]:
@@ -34,26 +40,22 @@ def _record_serp_request(query: str, status: int) -> None:
         pass
 
 
+def _retry_delay(attempt: int) -> float:
+    """Return a short exponential-backoff delay with jitter."""
+    return (2 ** attempt) + random.uniform(0, 1)
+
+
 def search_serp(
     query: str,
-    timeout: int = 20,
+    timeout: int = SERP_TIMEOUT_SECONDS,
     num: int = 10,
     start: int = 1,
     raw_save_path: str | None = None,
 ) -> dict:
     """Search Google via SERP API and return extracted results.
 
-    Args:
-        query: Search query string.
-        timeout: Request timeout in seconds.
-        num: Number of results (1-10).
-        start: 1-based result offset.
-
-    Returns:
-        dict with keys:
-            status (int): HTTP status code, or -1 on error.
-            output (list[dict]): List of result dicts with keys:
-                title, link, snippet, date, query.
+    Every actual upstream attempt is audited. Transient upstream failures are
+    retried twice, while authentication and request errors return immediately.
     """
     hl, gl = _detect_language(query)
     n = min(max(num, 1), 10)
@@ -69,33 +71,44 @@ def search_serp(
         "Authorization": f"Bearer {SERP_DEV_KEY}",
         "Content-Type": "application/json",
     }
-    try:
-        resp = requests.post(SERP_API_URL, headers=headers, json=body, timeout=timeout)
-        _record_serp_request(query, resp.status_code)
-        if raw_save_path and resp.status_code == 200:
-            os.makedirs(os.path.dirname(raw_save_path) or ".", exist_ok=True)
-            with open(raw_save_path, "w", encoding="utf-8") as f:
-                f.write(resp.text)
-        if resp.status_code != 200:
-            return {"status": resp.status_code, "output": [], "error": resp.text[:300]}
-        data = resp.json()
-        results = [
-            {
-                "title": item.get("title", ""),
-                "link": item.get("link", ""),
-                "snippet": item.get("snippet", ""),
-                "date": item.get("date", ""),
-                "query": query,
-            }
-            for item in data.get("organic", [])
-        ]
-        return {"status": resp.status_code, "output": results}
-    except Exception as e:
-        # A transport failure is still a billable/search attempt from the
-        # evaluator's perspective. Record it so per-run usage accounting does
-        # not silently omit timeouts, DNS failures, or connection resets.
-        _record_serp_request(query, -1)
-        return {"status": -1, "output": [], "error": str(e)[:300]}
+    for attempt in range(SERP_MAX_ATTEMPTS):
+        try:
+            resp = requests.post(
+                SERP_API_URL, headers=headers, json=body, timeout=timeout
+            )
+            # Audit every upstream attempt, including failures that are retried.
+            _record_serp_request(query, resp.status_code)
+            if resp.status_code == 200:
+                if raw_save_path:
+                    os.makedirs(os.path.dirname(raw_save_path) or ".", exist_ok=True)
+                    with open(raw_save_path, "w", encoding="utf-8") as f:
+                        f.write(resp.text)
+                data = resp.json()
+                results = [
+                    {
+                        "title": item.get("title", ""),
+                        "link": item.get("link", ""),
+                        "snippet": item.get("snippet", ""),
+                        "date": item.get("date", ""),
+                        "query": query,
+                    }
+                    for item in data.get("organic", [])
+                ]
+                return {"status": resp.status_code, "output": results}
+            if (
+                resp.status_code not in RETRYABLE_STATUS_CODES
+                or attempt == SERP_MAX_ATTEMPTS - 1
+            ):
+                return {"status": resp.status_code, "output": [], "error": resp.text[:300]}
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            # A transport failure is still a billable/search attempt.
+            _record_serp_request(query, -1)
+            if attempt == SERP_MAX_ATTEMPTS - 1:
+                return {"status": -1, "output": [], "error": str(exc)[:300]}
+
+        time.sleep(_retry_delay(attempt))
+
+    raise AssertionError("unreachable")
 
 
 if __name__ == "__main__":

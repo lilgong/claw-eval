@@ -216,7 +216,7 @@ def web_search(req: SearchRequest) -> dict[str, Any]:
 
     try:
         num = min(req.max_results, 10)
-        serp_result = search_serp(query=req.query, num=num, timeout=20)
+        serp_result = search_serp(query=req.query, num=num)
         upstream_status = serp_result.get("status")
         if upstream_status != 200:
             api_failure = failure_marker(
