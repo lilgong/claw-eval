@@ -5,12 +5,13 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import threading
 import uuid
 
 
 _lock = threading.Lock()
-_path_cache: dict[str, str] = {}
+_path_cache: dict[tuple[str, str], str] = {}
 _turn_counter: dict[str, int] = {}
 
 
@@ -29,20 +30,19 @@ def _monthly_root(base: str) -> str:
         return os.path.join(base, datetime.date.today().strftime("%Y-%m"))
 
 
-def _log_path() -> str:
+def _log_path(key_suffix: str) -> str:
     today = str(datetime.date.today())
-    cached = _path_cache.get(today)
+    cache_key = (key_suffix, today)
+    cached = _path_cache.get(cache_key)
     if cached:
         return cached
 
-    base = os.getenv("SERP_LOG_DIR") or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        "serp_request_log",
-    )
+    base = os.path.expanduser(os.getenv("SERP_LOG_DIR") or "~/api_usage/claweval")
     root = _monthly_root(base)
     os.makedirs(root, exist_ok=True)
-    path = os.path.join(root, f"serp_requests_{today.replace('-', '')}.jsonl")
-    _path_cache[today] = path
+    safe_suffix = re.sub(r"[^A-Za-z0-9_-]", "_", key_suffix)
+    path = os.path.join(root, f"serp_requests_{safe_suffix}_{today.replace('-', '')}.jsonl")
+    _path_cache[cache_key] = path
     return path
 
 
@@ -50,6 +50,7 @@ def log_serp_request(
     *,
     query: str,
     status: int,
+    api_key: str | None,
     attempt: int = 1,
     error: str | None = None,
     task_id: str | None = None,
@@ -58,6 +59,7 @@ def log_serp_request(
     if not _enabled():
         return
     try:
+        key_suffix = api_key[-8:] if api_key else "no-key"
         resolved_task = task_id or os.getenv("CLAW_TASK_ID") or None
         counter_key = resolved_task or "-"
         with _lock:
@@ -66,6 +68,7 @@ def log_serp_request(
 
         record = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "key_suffix": key_suffix,
             "task_id": resolved_task,
             "turn": turn,
             "call_id": uuid.uuid4().hex[:12],
@@ -76,7 +79,7 @@ def log_serp_request(
         if error:
             record["error"] = " ".join(str(error).split())[:300]
         line = json.dumps(record, ensure_ascii=False) + "\n"
-        with _lock, open(_log_path(), "a", encoding="utf-8") as handle:
+        with _lock, open(_log_path(key_suffix), "a", encoding="utf-8") as handle:
             try:
                 import fcntl
 

@@ -37,6 +37,63 @@ class FakeResponse:
 
 
 class SerperRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for module_name in MODULES:
+            module = importlib.import_module(module_name)
+            for name, value in (("SERP_API_URL", "https://search.example.test/search"),
+                                ("SERP_DEV_KEY", "test-key-5L04ReLB")):
+                patcher = patch.object(module, name, value)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+
+    def test_missing_config_never_sends_request(self) -> None:
+        for module_name in MODULES:
+            module = importlib.import_module(module_name)
+            for field in ("SERP_API_URL", "SERP_DEV_KEY"):
+                with self.subTest(module=module_name, missing=field):
+                    with patch.object(module, field, ""), patch.object(module.requests, "post") as post:
+                        with self.assertRaisesRegex(ValueError, "SERP_API_URL and SERP_DEV_KEY"):
+                            module.search_serp("test")
+                        post.assert_not_called()
+
+    def test_search_ignores_fallback_environment_keys(self) -> None:
+        for module_name in MODULES:
+            module = importlib.import_module(module_name)
+            try:
+                with patch.dict("os.environ", {
+                    "SERP_API_KEY": "unused-fallback", "YIBUAPI_KEY": "unused-fallback",
+                }, clear=True):
+                    importlib.reload(module)
+                    self.assertEqual(module.SERP_API_URL, "")
+                    self.assertEqual(module.SERP_DEV_KEY, "")
+            finally:
+                module.SERP_API_URL = "https://search.example.test/search"
+                module.SERP_DEV_KEY = "test-key-5L04ReLB"
+
+    def test_both_search_clients_log_selected_key_in_monthly_files(self) -> None:
+        from claw_eval import serp_log
+        import datetime
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict("os.environ", {"SERP_LOG_DIR": temp_dir, "CLAW_SERP_LOG": "1"}):
+                serp_log._path_cache.clear()
+                self.addCleanup(serp_log._path_cache.clear)
+                for module_name, suffix in zip(MODULES, ("5L04ReLB", "ICYqoIoB")):
+                    module = importlib.import_module(module_name)
+                    with patch.object(module, "SERP_DEV_KEY", "test-secret-" + suffix):
+                        module._record_serp_request("test", -1, 1, "Read timed out")
+                        module._record_serp_request("test", 200, 2)
+            files = list(Path(temp_dir).rglob("*.jsonl"))
+            self.assertEqual(len(files), 2)
+            for file in files:
+                self.assertEqual(file.parent.name, datetime.date.today().strftime("%Y-%m"))
+                records = [json.loads(line) for line in file.read_text().splitlines()]
+                self.assertEqual([r["http_status"] for r in records], [-1, 200])
+                self.assertEqual([r["attempt"] for r in records], [1, 2])
+                self.assertEqual(records[0]["key_suffix"], records[1]["key_suffix"])
+                self.assertIn(records[0]["key_suffix"], file.name)
+                self.assertNotIn("test-secret-", file.read_text())
+
     def test_transient_failures_retry_then_succeed(self) -> None:
         for module_name in MODULES:
             with self.subTest(module=module_name):
@@ -243,6 +300,7 @@ class SerperRetryTests(unittest.TestCase):
                 serp_log.log_serp_request(
                     query="logged query",
                     status=-1,
+                    api_key="test-secret-5L04ReLB",
                     attempt=2,
                     error="Read timed out after 20 seconds",
                 )
@@ -251,6 +309,9 @@ class SerperRetryTests(unittest.TestCase):
             self.assertEqual(len(files), 1)
             record = json.loads(files[0].read_text(encoding="utf-8"))
             self.assertEqual(record["task_id"], "T_TEST")
+            self.assertEqual(record["key_suffix"], "5L04ReLB")
+            self.assertIn("serp_requests_5L04ReLB_", files[0].name)
+            self.assertNotIn("test-secret-", files[0].read_text(encoding="utf-8"))
             self.assertEqual(record["query"], "logged query")
             self.assertEqual(record["http_status"], -1)
             self.assertEqual(record["attempt"], 2)

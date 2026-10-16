@@ -14,12 +14,8 @@ import requests
 
 from claw_eval.api_health import classify_failure
 
-SERP_API_URL = os.getenv("SERP_API_URL", "https://yibuapi.com/serper/search")
-SERP_DEV_KEY = (
-    os.getenv("SERP_API_KEY")
-    or os.getenv("SERP_DEV_KEY")
-    or os.getenv("YIBUAPI_KEY", "")
-)
+SERP_API_URL = os.getenv("SERP_API_URL", "").strip()
+SERP_DEV_KEY = os.getenv("SERP_DEV_KEY", "").strip()
 SERP_MAX_ATTEMPTS = 3
 
 
@@ -38,6 +34,7 @@ def _record_serp_request(
 
         log_serp_request(
             query=query, status=status, attempt=attempt, error=error,
+            api_key=SERP_DEV_KEY,
         )
     except Exception:
         pass
@@ -80,6 +77,8 @@ def search_serp(
             output (list[dict]): List of result dicts with keys:
                 title, link, snippet, date, query.
     """
+    if not SERP_API_URL or not SERP_DEV_KEY:
+        raise ValueError("Serper requires explicit SERP_API_URL and SERP_DEV_KEY")
     hl, gl = _detect_language(query)
     n = min(max(num, 1), 10)
     page = max(1, ((max(start, 1) - 1) // n) + 1)

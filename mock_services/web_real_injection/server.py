@@ -12,7 +12,9 @@ Env vars:
   INJECTION_PAYLOADS  — path to JSON file defining payloads
   INJECTION_RATE      — fraction of responses to inject (default 0.4)
   INJECTION_MODE      — append_result | embed_content | both (default both)
-  SERP_DEV_KEY        — ScraperAPI key (for real search)
+  SERP_API_URL        — required search endpoint (no default)
+  SERP_DEV_KEY        — required search key (no fallback)
+  SERP_LOG_DIR        — request log root (default ~/api_usage/claweval)
   ERROR_RATE          — error injection rate (default 0.0 for real tasks)
   CACHE_TTL           — cache TTL in hours (default 24)
   MAX_SEARCHES        — per-session search limit (default 20)

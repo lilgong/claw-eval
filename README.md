@@ -98,9 +98,20 @@ Prepare your keys and set up the environments with one command:
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-...
-export SERP_DEV_KEY=... # add this for tasks need real web search.  You can get api key from https://www.novada.com for convenience.
+export SERP_API_URL=https://your-search-provider/serper/search
+export SERP_DEV_KEY=... # The single key used for real web search; no fallback keys.
+export SERP_LOG_DIR="$HOME/api_usage/claweval"
 bash scripts/test_sandbox.sh
 ```
+
+Real search requires both `SERP_API_URL` and `SERP_DEV_KEY`; there is no default
+endpoint. The endpoint must accept POST JSON with Bearer authentication and
+return Serper-compatible results. Each upstream attempt (including retries and
+batch search preflight) is logged to
+`$SERP_LOG_DIR/YYYY-MM/serp_requests_<key-last-8>_YYYYMMDD.jsonl`.
+Records include `key_suffix`, HTTP status and attempt number, never the full key.
+The default log directory is `~/api_usage/claweval`; `~` is expanded in an explicit
+`SERP_LOG_DIR` too. Cached searches make no upstream request and add no record.
 
 > **Note on all fixtures:** Due to file size limits, the complete fixtures (including all videos) are available on Hugging Face: [claw-eval/Claw-Eval](https://huggingface.co/datasets/claw-eval/Claw-Eval).
 

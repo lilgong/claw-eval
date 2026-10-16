@@ -206,17 +206,20 @@ PY
   fi
 
   if grep -rlq 'web_real' "$tasks_dir"/*/task.yaml 2>/dev/null; then
-    local serp_url=${SERP_API_URL:-https://yibuapi.com/serper/search}
-    local serp_key=${SERP_API_KEY:-${SERP_DEV_KEY:-${YIBUAPI_KEY:-}}}
+    local serp_url=${SERP_API_URL:-}
+    local serp_key=${SERP_DEV_KEY:-}
     local serp_body
-    if [ -z "$serp_key" ]; then
-      echo "  [FAIL] 缺少 SERP_API_KEY / SERP_DEV_KEY"
+    if [ -z "${serp_url//[[:space:]]/}" ] || [ -z "${serp_key//[[:space:]]/}" ]; then
+      echo "  [FAIL] 必须显式设置 SERP_API_URL 和 SERP_DEV_KEY"
       failed=1
-    elif serp_body=$(curl -fsS -m 30 "$serp_url" \
-      -H "Authorization: Bearer $serp_key" \
-      -H 'Content-Type: application/json' \
-      -d '{"q":"OpenAI official documentation","num":1,"gl":"us","hl":"en","page":1}'); then
-      if printf '%s' "$serp_body" | .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); assert isinstance(d.get("organic"), list) and d["organic"]'; then
+    elif serp_body=$(.venv/bin/python - <<'PY'
+import json
+from mock_services.web_real.search_serp import search_serp
+
+print(json.dumps(search_serp("OpenAI official documentation", num=1)))
+PY
+    ); then
+      if printf '%s' "$serp_body" | .venv/bin/python -c 'import json,sys; d=json.load(sys.stdin); assert d.get("status") == 200 and d.get("output")'; then
         echo "  [OK] SERP：$serp_url"
       else
         echo "  [FAIL] SERP 返回格式异常或没有搜索结果：$serp_url"

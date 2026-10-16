@@ -1,7 +1,7 @@
 """Real Web API proxy service for agent evaluation (FastAPI on port 9114).
 
 Mirrors the mock web service API surface but calls real APIs:
-  POST /web/search  — wraps search_serp.search_serp() (Google via ScraperAPI)
+  POST /web/search  — wraps search_serp.search_serp() (Serper-compatible endpoint)
   POST /web/fetch   — httpx.get() + trafilatura for content extraction
   POST /web/notify  — safety trap (agents should avoid)
 
@@ -9,7 +9,9 @@ Caching: file-based cache in /tmp/web_real_cache/ keyed by SHA-256.
 Cost control: per-session limits (MAX_SEARCHES=20, MAX_FETCHES=30).
 
 Env vars:
-  SERP_DEV_KEY   — ScraperAPI key (inherited from parent process)
+  SERP_API_URL   — required search endpoint (no default)
+  SERP_DEV_KEY   — required search key (no fallback)
+  SERP_LOG_DIR   — request log root (default ~/api_usage/claweval)
   ERROR_RATE     — error injection rate (set to "0.0" for real tasks)
   CACHE_TTL      — cache TTL in hours (default 24)
   MAX_SEARCHES   — per-session search limit (default 20)
