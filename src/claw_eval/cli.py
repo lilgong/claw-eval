@@ -1057,18 +1057,19 @@ def _load_completed_results(trace_dir: Path) -> list[dict]:
     for f in sorted(trace_dir.glob("*.jsonl")):
         grading = None
         trace_end = None
-        for line_str in open(f):
-            line_str = line_str.strip()
-            if not line_str:
-                continue
-            try:
-                ev = json.loads(line_str)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "grading_result":
-                grading = ev
-            elif ev.get("type") == "trace_end":
-                trace_end = ev
+        with open(f) as fh:
+            for line_str in fh:
+                line_str = line_str.strip()
+                if not line_str:
+                    continue
+                try:
+                    ev = json.loads(line_str)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") == "grading_result":
+                    grading = ev
+                elif ev.get("type") == "trace_end":
+                    trace_end = ev
 
         if grading is None:
             continue
@@ -1134,6 +1135,72 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}h{m:02d}m"
 
 
+def _merge_continue_results(
+    completed: list[dict], updates: list[dict], trials: int,
+    metadata: list[dict] = (),
+) -> list[dict]:
+    """Merge graded traces and current attempts without losing or doubling trials.
+
+    Only graded traces are reused from older runs. Errors from the current run
+    remain visible, while errors superseded by a resumed attempt are not reused.
+    ``metadata`` supplies names only, never stale scores or old failed attempts.
+    """
+    from .models.scoring import compute_pass_at_k, compute_pass_hat_k, is_pass
+
+    merged: dict[str, dict] = {}
+    names = {row["task_id"]: row for row in metadata}
+    for row in [*completed, *updates]:
+        tid = row["task_id"]
+        dest = merged.setdefault(tid, {
+            "task_id": tid, "task_name": names.get(tid, {}).get("task_name", ""),
+            "difficulty": names.get(tid, {}).get("difficulty", ""),
+            "trials": [], "error": None,
+        })
+        for key in ("task_name", "difficulty"):
+            if row.get(key):
+                dest[key] = row[key]
+        if row.get("error"):
+            dest["error"] = row["error"]
+        seen = {
+            str(Path(t["trace"]).resolve()) for t in dest["trials"] if t.get("trace")
+        }
+        for trial in row.get("trials", []):
+            path = str(Path(trial["trace"]).resolve()) if trial.get("trace") else None
+            if path is not None and path in seen:
+                continue
+            dest["trials"].append(dict(trial))
+            if path is not None:
+                seen.add(path)
+
+    for row in merged.values():
+        attempts = row["trials"]
+        scores = [0.0 if t.get("error") else t.get("task_score", 0.0) for t in attempts]
+        # Missing attempts cannot make 2/2 look like 3/3 in partial results.
+        scores += [0.0] * max(0, trials - len(scores))
+        row["avg_score"] = sum(scores) / len(scores)
+        row["pass_at_1"] = compute_pass_at_k(scores, k=1)
+        row["pass_hat_k"] = compute_pass_hat_k(scores, k=trials)
+        row["avg_passed"] = is_pass(row["avg_score"])
+    return sorted(merged.values(), key=lambda r: r["task_id"])
+
+
+def _batch_score_counts(results: list[dict], trials: int) -> tuple[float, int, int, int]:
+    """Compute whole-batch scores, counting failed/missing attempts as zero."""
+    from .models.scoring import is_pass
+
+    total_score = 0.0
+    pass_hat = pass_at = errored = 0
+    for row in results:
+        attempts = row.get("trials", [])
+        scores = [0.0 if t.get("error") else t.get("task_score", 0.0) for t in attempts]
+        total_score += sum(scores) / max(trials, len(scores))
+        passed = [not t.get("error") and is_pass(t.get("task_score", 0.0)) for t in attempts]
+        pass_hat += len(attempts) == trials and all(passed) and not row.get("error")
+        pass_at += any(passed)
+        errored += bool(row.get("error") or any(t.get("error") for t in attempts))
+    return total_score / len(results) if results else 0.0, pass_hat, pass_at, errored
+
+
 def cmd_batch(args: argparse.Namespace) -> None:
     """Run all (or filtered) tasks in parallel."""
     _apply_proxy(getattr(args, "proxy", None))
@@ -1169,6 +1236,7 @@ def cmd_batch(args: argparse.Namespace) -> None:
     continue_dir = getattr(args, "continue_dir", None)
     completed_trials: dict[str, int] = {}
     continue_prev_results: list[dict] = []
+    continue_metadata: list[dict] = []
     if continue_dir:
         continue_path = Path(continue_dir)
         if not continue_path.exists():
@@ -1176,6 +1244,10 @@ def cmd_batch(args: argparse.Namespace) -> None:
             sys.exit(1)
         completed_trials = _scan_completed_trials(continue_path)
         continue_prev_results = _load_completed_results(continue_path)
+        previous_file = continue_path / "batch_results.json"
+        if previous_file.exists():
+            with open(previous_file) as fh:
+                continue_metadata = json.load(fh)
         total_completed = sum(completed_trials.values())
         print(f"[continue] Scanning {continue_path} — found {total_completed} completed trial(s) "
               f"across {len(completed_trials)} task(s)")
@@ -1246,10 +1318,10 @@ def cmd_batch(args: argparse.Namespace) -> None:
 
     if not task_dirs:
         if continue_dir:
-            print("All tasks already completed — nothing to run.")
+            print("All selected tasks already completed — rebuilding batch results and summary.")
         else:
             print("No tasks matched.")
-        return
+            return
 
     total = len(task_dirs)
 
@@ -1386,7 +1458,11 @@ def cmd_batch(args: argparse.Namespace) -> None:
                 _partial_file = _partial_out / "batch_results.json"
                 try:
                     with open(_partial_file, "w") as _pf:
-                        json.dump(results, _pf, indent=2, ensure_ascii=False)
+                        partial_results = _merge_continue_results(
+                            continue_prev_results if continue_dir else [], results,
+                            trials, continue_metadata,
+                        )
+                        json.dump(partial_results, _pf, indent=2, ensure_ascii=False)
                 except Exception:
                     pass  # best-effort; don't crash on incremental write failure
 
@@ -1475,10 +1551,14 @@ def cmd_batch(args: argparse.Namespace) -> None:
     # contains tasks that were re-run in *this* invocation).
     if continue_dir:
         all_from_traces = _load_completed_results(Path(continue_dir))
-        if all_from_traces:
-            results = all_from_traces
-            total = len(results)
-            print(f"\n[continue] Rebuilt results from {total} task(s) in trace directory")
+        results = _merge_continue_results(
+            all_from_traces, results, trials, continue_metadata,
+        )
+        total = len(results)
+        print(f"\n[continue] Rebuilt results from {total} task(s) in trace directory")
+    else:
+        # Use the same task-level accounting for full runs and continued runs.
+        results = _merge_continue_results([], results, trials)
 
     # --- Summary ---
     print(f"\n{'='*60}")
@@ -1495,8 +1575,8 @@ def cmd_batch(args: argparse.Namespace) -> None:
         print(f"BATCH COMPLETE — {total} tasks, {workers} workers")
     print(f"{'='*60}\n")
 
-    errored = sum(1 for r in results if r.get("error"))
-    avg_score_final = score_sum / finished_tasks if finished_tasks else 0.0
+    avg_score_final, n_pass_hat, n_pass_at, errored = _batch_score_counts(results, trials)
+    summary_tasks = len(results)
     total_model_input_tokens = sum(
         tr.get("model_input_tokens", tr.get("input_tokens", 0))
         for r in results for tr in r.get("trials", [])
@@ -1512,9 +1592,9 @@ def cmd_batch(args: argparse.Namespace) -> None:
     total_wall_time_s = sum(tr.get("wall_time_s", 0.0) for r in results for tr in r.get("trials", []))
 
     print(f"  Avg score: {avg_score_final:.3f}")
-    print(f"  pass^{trials}: {n_pass_hat}/{finished_tasks}")
-    print(f"  pass@{trials}: {n_pass_at}/{finished_tasks}")
-    print(f"  Errored: {errored}/{finished_tasks}")
+    print(f"  pass^{trials}: {n_pass_hat}/{summary_tasks}")
+    print(f"  pass@{trials}: {n_pass_at}/{summary_tasks}")
+    print(f"  Errored: {errored}/{summary_tasks}")
     print(
         f"  Total model tokens: {total_tokens} "
         f"({total_model_input_tokens} in / {total_model_output_tokens} out)"
@@ -1552,9 +1632,9 @@ def cmd_batch(args: argparse.Namespace) -> None:
             else:
                 # Multi-trial: show avg score + per-trial scores + pass^k/pass@k
                 tl = r["trials"]
-                avg_sc = sum(tr["task_score"] for tr in tl) / len(tl)
+                avg_sc = r["avg_score"]
                 trial_strs = "/".join(f"{t['task_score']:.2f}" for t in tl)
-                p_hat = "Y" if all(tr["passed"] for tr in tl) else "N"
+                p_hat = "Y" if len(tl) == trials and all(tr["passed"] for tr in tl) else "N"
                 p_at = "Y" if any(tr["passed"] for tr in tl) else "N"
                 total_tok = sum(t.get("tokens", 0) for t in tl)
                 total_in = sum(t.get("model_input_tokens", t.get("input_tokens", 0)) for t in tl)
@@ -1564,7 +1644,7 @@ def cmd_batch(args: argparse.Namespace) -> None:
                 total_tool = sum(t.get("tool_time_s", 0.0) for t in tl)
                 print(f"  {tid:40s}  {avg_sc:.2f}  "
                       f"trials=[{trial_strs}] "
-                      f"pass^{len(tl)}={p_hat} pass@{len(tl)}={p_at} "
+                      f"pass^{trials}={p_hat} pass@{trials}={p_at} "
                       f"TOK={total_tok} ({total_in}in/{total_out}out) "
                       f"TIME=wall {total_wall:.2f}s "
                       f"model {total_model:.2f}s "
